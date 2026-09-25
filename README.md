@@ -1,126 +1,125 @@
 # Face Recognition with ArcFace ONNX and 5-Point Alignment
 
-A local, camera-based face-recognition pipeline using:
+A local, CPU-friendly face-recognition pipeline for enrolling people from a webcam and recognizing them in real time. The pipeline is:
 
-- OpenCV for camera access and image processing
-- Haar detection with MediaPipe FaceMesh landmarks
-- Five-point face alignment to `112 x 112`
-- An ArcFace-style ONNX model for face embeddings
-- A local NumPy/JSON face database for enrollment and recognition
+```text
+webcam -> Haar face detection -> MediaPipe FaceMesh 5-point landmarks
+		  -> 112 x 112 alignment -> ArcFace ONNX embedding -> cosine-distance match
+```
+
+The project keeps the face database on disk as NumPy and JSON files. It does not send camera frames or embeddings to a remote service.
 
 ## Requirements
 
 - Windows, macOS, or Linux
 - Python 3.10-3.13
 - A working webcam
-- The ArcFace ONNX model at:
+- A compatible ArcFace-style ONNX model at:
 
 ```text
 models/embedder_arcface.onnx
 ```
 
-The model is not included in this repository. Add a compatible ArcFace ONNX model at that path before running the embedding, enrollment, evaluation, or recognition scripts.
+The model is not included in this repository. The model must accept an aligned `112 x 112` image and return a face embedding. Do not commit model files or captured face data unless you intend to share them.
 
-## Setup
+## Installation
 
-From the project root, create and activate a virtual environment.
-
-### Windows PowerShell
+Run these commands from the repository root. On Windows PowerShell:
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install opencv-python numpy onnxruntime mediapipe==0.10.21
 ```
 
-If PowerShell blocks activation, run this once for the current user:
+If PowerShell blocks activation, allow scripts for your user account:
 
 ```powershell
 Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
 ```
 
-Install the dependencies:
+The `.venv` directory is local to your machine and is excluded from git. Keep the terminal in the repository root when running the modules so relative paths such as `models/` and `data/` resolve correctly.
 
-```powershell
-python -m pip install --upgrade pip
-python -m pip install opencv-python numpy onnxruntime mediapipe==0.10.21
-```
+## Quick Start
 
-The `.venv` directory is local to your machine and should not be committed. It is already excluded by `.gitignore`.
+1. Put the ONNX model at `models/embedder_arcface.onnx`.
+2. Check that the webcam opens:
 
-## Usage
+	```powershell
+	python -m src.camera
+	```
 
-Run commands from the project root while the virtual environment is active.
+3. Enroll a person:
 
-### Check the camera
+	```powershell
+	python -m src.enroll
+	```
 
-```powershell
-python -m src.camera
-```
+	Enter a name, then capture at least 15 varied samples. Use `SPACE` for a capture, `a` to toggle automatic capture, `s` to save, `r` to reset only new captures, and `q` to quit.
 
-### Test face detection
+4. Start recognition:
 
-```powershell
-python -m src.detect
-```
+	```powershell
+	python -m src.recognize
+	```
 
-### Preview five-point alignment
+	Recognition labels a face only when its cosine distance is at or below the current threshold. Use `q` to quit, `r` to reload the database, `+` or `-` to adjust the threshold, and `d` to toggle debug overlays.
 
-```powershell
-python -m src.align
-```
+## Development Commands
 
-Press `q` to quit or `s` to save the current aligned face under `data/debug_aligned/`.
+Run each module from the repository root:
 
-### Enroll a person
+| Command | Purpose | Keys |
+| --- | --- | --- |
+| `python -m src.camera` | Webcam smoke test | `q` quit |
+| `python -m src.detect` | Haar face-detection preview | `q` quit |
+| `python -m src.align` | Preview 5-point alignment | `q` quit, `s` save an aligned crop |
+| `python -m src.embed` | Preview ArcFace embeddings | `q` quit, `p` print embedding stats |
+| `python -m src.evaluate` | Measure enrolled genuine/impostor distances | terminal output |
 
-```powershell
-python -m src.enroll
-```
+The camera demos currently use camera index `1`. If the webcam is exposed at another index, change the `cv2.VideoCapture(...)` value in the relevant script.
 
-Enter a name when prompted and follow the on-screen capture instructions. Enrollment creates:
+## Generated Data
+
+Enrollment creates or updates:
 
 ```text
-data/db/face_db.npz
-data/db/face_db.json
-data/enroll/<person-name>/
+data/
+├── db/
+│   ├── face_db.npz       # normalized embedding per enrolled name
+│   └── face_db.json      # enrollment metadata
+└── enroll/
+	 └── <person-name>/    # aligned 112 x 112 JPG crops
 ```
 
-### Recognize enrolled people
+The alignment demo saves previews under `data/debug_aligned/`. These folders contain biometric data and should be treated as private. Delete them when they are no longer needed.
 
-```powershell
-python -m src.recognize
-```
+## Evaluation and Thresholds
 
-The recognition window supports:
-
-- `q`: quit
-- `r`: reload the face database
-- `+` / `-`: adjust the match threshold
-- `d`: toggle debug overlays
-
-### Evaluate the enrolled database
+After enrolling at least two people with at least five valid aligned crops each, run:
 
 ```powershell
 python -m src.evaluate
 ```
 
-## Project layout
+The evaluator reports genuine distances for same-person pairs and impostor distances for different-person pairs. It then suggests a distance threshold that keeps the measured false-accept rate at or below the configured target (`1%` by default). More varied enrollment samples produce a more useful threshold; the result is only a local estimate, not a security certification.
+
+## Project Layout
 
 ```text
 face-recognition-5pt/
-├── data/
-│   ├── db/              Generated face database files
-│   ├── debug_aligned/   Saved alignment previews
-│   └── enroll/          Captured enrollment faces
-├── models/              Local ONNX model files
+├── data/                 Captured crops and generated face database
+├── models/               Local ONNX model files
 ├── src/
-│   ├── align.py         Five-point alignment demo
-│   ├── detect.py        Face detection demo
-│   ├── embed.py         ArcFace embedding demo
-│   ├── enroll.py        Build the local face database
-│   ├── evaluate.py      Evaluate enrolled samples
-│   ├── haar_5pt.py      Haar and five-point detection pipeline
-│   └── recognize.py     Real-time recognition
+│   ├── camera.py         Webcam smoke test
+│   ├── detect.py         Haar detection demo
+│   ├── align.py          Five-point alignment demo
+│   ├── embed.py          ArcFace embedding demo
+│   ├── enroll.py         Build or update the local face database
+│   ├── evaluate.py       Evaluate enrolled samples and thresholds
+│   ├── haar_5pt.py       Haar and landmark alignment pipeline
+│   └── recognize.py      Real-time multi-face recognition
 └── README.md
 ```
 
@@ -128,11 +127,11 @@ face-recognition-5pt/
 
 ### Camera does not open
 
-Close other applications using the webcam. The scripts use camera index `0` in the main recognition and enrollment flows. If your camera uses another index, update the `cv2.VideoCapture(...)` value in the relevant script.
+Close other applications using the webcam. Try camera indices `0`, `1`, or `2` by changing `cv2.VideoCapture(...)` in the module you are running.
 
 ### MediaPipe cannot be imported
 
-Confirm that the virtual environment is active, then reinstall the pinned version:
+Confirm that `.venv` is active and reinstall the pinned version:
 
 ```powershell
 python -m pip install --force-reinstall mediapipe==0.10.21
@@ -140,8 +139,12 @@ python -m pip install --force-reinstall mediapipe==0.10.21
 
 ### The ONNX model cannot be found
 
-Run the commands from the repository root and confirm this file exists:
+Run from the repository root and confirm this file exists:
 
 ```text
 models/embedder_arcface.onnx
 ```
+
+### Recognition is unreliable
+
+Enroll more varied samples with different lighting, angles, and expressions. Then run `python -m src.evaluate` and use its suggested threshold as a starting point. Avoid treating a camera-only demo as an access-control system without additional safeguards.
