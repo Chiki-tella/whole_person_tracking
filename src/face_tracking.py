@@ -6,12 +6,14 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from src.mqtt_controller import MQTTController
 from src.align import align_face_5pt
 from src.face_signals import FaceSignalExtractor
 from src.recognize import (
     ArcFaceEmbedderONNX,
     FaceDBMatcher,
     HaarFaceMesh5pt,
+    YuNetFaceDetector,
     load_db_npz,
 )
 
@@ -325,23 +327,44 @@ def main():
     )
 
     parser.add_argument(
+        "--detector",
+        choices=["yunet", "haar"],
+        default="yunet",
+        help="face detector (default: yunet)",
+    )
+
+    parser.add_argument(
+        "--yunet-model",
+        default="models/face_detection_yunet_2023mar.onnx",
+        help="path to YuNet ONNX model",
+    )
+
+    parser.add_argument(
         "--camera",
         type=int,
         default=0,
+        help="camera index (default: 0)",
     )
 
     parser.add_argument(
         "--threshold",
         type=float,
-        default=0.34,
+        default=0.70,
+        help="verification threshold (e.g. 0.70 for 70% similarity, or 0.30 distance)",
     )
 
     args = parser.parse_args()
 
-    detector = HaarFaceMesh5pt(
-        min_size=(70, 70),
-        debug=False,
-    )
+    if args.detector == "yunet" and Path(args.yunet_model).exists():
+        print(f"[face_tracking] Using YuNet detector ({args.yunet_model})")
+        detector = YuNetFaceDetector(model_path=args.yunet_model, debug=False)
+    else:
+        if args.detector == "yunet":
+            print(f"[face_tracking] Notice: YuNet model not found at {args.yunet_model}, falling back to Haar")
+        detector = HaarFaceMesh5pt(
+            min_size=(70, 70),
+            debug=False,
+        )
 
     embedder = ArcFaceEmbedderONNX(
         model_path="models/embedder_arcface.onnx",
@@ -365,13 +388,24 @@ def main():
 
     signals = FaceSignalExtractor()
 
+    mqtt = MQTTController()
+    try:
+        mqtt.connect()
+    except Exception as e:
+        print(f"[MQTT] Notice: Could not connect to broker ({e}). Continuing in standalone mode.")
+
     cap = cv2.VideoCapture(
         args.camera
     )
 
     if not cap.isOpened():
+        fallback_idx = 1 if args.camera == 0 else 0
+        print(f"[face_tracking] Camera {args.camera} failed, trying camera {fallback_idx}...")
+        cap = cv2.VideoCapture(fallback_idx)
+
+    if not cap.isOpened():
         raise RuntimeError(
-            "Camera not available"
+            "Camera not available. Check webcam connection."
         )
 
     blink_total = 0
@@ -386,6 +420,12 @@ def main():
             locked_face, position = tracker.update(
                 frame
             )
+            if position is not None:
+              mqtt.publish_horizontal(
+                position.horizontal
+              )   
+            else:
+             mqtt.stop()
 
             view = frame.copy()
 
@@ -535,6 +575,9 @@ def main():
                 break
 
     finally:
+    
+        mqtt.disconnect()
+
         cap.release()
         signals.close()
         cv2.destroyAllWindows()

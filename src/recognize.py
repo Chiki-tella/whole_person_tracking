@@ -25,6 +25,7 @@ Notes:
 
 from __future__ import annotations
 
+import argparse
 import time
 import json
 from dataclasses import dataclass
@@ -331,8 +332,109 @@ class ArcFaceEmbedderONNX:
 
 
 # -------------------------
-# Multi-face Haar + FaceMesh(ROI) 5pt
+# Face Detectors: YuNet (fast ONNX DNN) and Haar (legacy)
 # -------------------------
+
+
+class YuNetFaceDetector:
+    """
+    Fast, CPU-friendly YuNet face detector using OpenCV DNN (cv2.FaceDetectorYN).
+    Directly predicts bounding boxes and 5 facial landmarks (right eye, left eye,
+    nose tip, right mouth corner, left mouth corner) on CPU in a single pass.
+    """
+
+    def __init__(
+        self,
+        model_path: str = "models/face_detection_yunet_2023mar.onnx",
+        conf_thresh: float = 0.60,
+        nms_thresh: float = 0.30,
+        top_k: int = 5000,
+        input_size: Tuple[int, int] = (320, 320),
+        debug: bool = False,
+    ):
+        self.model_path = str(model_path)
+        self.conf_thresh = float(conf_thresh)
+        self.nms_thresh = float(nms_thresh)
+        self.top_k = int(top_k)
+        self.debug = bool(debug)
+        self.in_w, self.in_h = int(input_size[0]), int(input_size[1])
+
+        if not Path(self.model_path).exists():
+            raise FileNotFoundError(
+                f"YuNet ONNX model not found at {self.model_path}."
+            )
+
+        self.detector = cv2.FaceDetectorYN.create(
+            self.model_path,
+            "",
+            (self.in_w, self.in_h),
+            score_threshold=self.conf_thresh,
+            nms_threshold=self.nms_thresh,
+            top_k=self.top_k,
+        )
+
+    def detect(
+        self,
+        frame_bgr: np.ndarray,
+        max_faces: int = 5,
+    ) -> List[FaceDet]:
+        H, W = frame_bgr.shape[:2]
+        if (W, H) != (self.in_w, self.in_h):
+            self.detector.setInputSize((W, H))
+            self.in_w, self.in_h = W, H
+
+        _, faces = self.detector.detect(frame_bgr)
+        if faces is None or len(faces) == 0:
+            return []
+
+        # Sort by area descending
+        faces = sorted(faces, key=lambda f: float(f[2] * f[3]), reverse=True)[:max_faces]
+        out: List[FaceDet] = []
+
+        for f in faces:
+            w, h = float(f[2]), float(f[3])
+            score = float(f[14])
+
+            # Landmarks from YuNet:
+            # f[4:6]: right eye (subject's right = image left)
+            # f[6:8]: left eye (subject's left = image right)
+            # f[8:10]: nose tip
+            # f[10:12]: right mouth corner
+            # f[12:14]: left mouth corner
+            kps = np.array([
+                [f[4], f[5]],
+                [f[6], f[7]],
+                [f[8], f[9]],
+                [f[10], f[11]],
+                [f[12], f[13]],
+            ], dtype=np.float32)
+
+            # Enforce image-space left-to-right eye ordering (smaller x first)
+            if kps[0, 0] > kps[1, 0]:
+                kps[[0, 1]] = kps[[1, 0]]
+            if kps[3, 0] > kps[4, 0]:
+                kps[[3, 4]] = kps[[4, 3]]
+
+            if not _kps_span_ok(kps, min_eye_dist=max(8.0, 0.15 * float(w))):
+                if self.debug:
+                    print("[YuNet] 5pt geometry sanity failed -> skip")
+                continue
+
+            bb = _bbox_from_5pt(kps, pad_x=0.55, pad_y_top=0.85, pad_y_bot=1.15)
+            x1, y1, x2, y2 = _clip_xyxy(bb[0], bb[1], bb[2], bb[3], W, H)
+
+            out.append(
+                FaceDet(
+                    x1=x1,
+                    y1=y1,
+                    x2=x2,
+                    y2=y2,
+                    score=score,
+                    kps=kps.astype(np.float32),
+                )
+            )
+
+        return out
 
 
 class HaarFaceMesh5pt:
@@ -583,12 +685,19 @@ class FaceDBMatcher:
     def __init__(
         self,
         db: Dict[str, np.ndarray],
-        dist_thresh: float = 0.34,
+        dist_thresh: float = 0.30,
     ):
         self.db = db
-        self.dist_thresh = float(
-            dist_thresh
-        )
+        # Auto-handle threshold as either similarity (e.g. 0.70 or 70%) or distance (0.30)
+        t = float(dist_thresh)
+        if t > 1.0:
+            t = t / 100.0
+        if t > 0.5:
+            self.sim_thresh = t
+            self.dist_thresh = 1.0 - t
+        else:
+            self.dist_thresh = t
+            self.sim_thresh = 1.0 - t
 
         # pre-stack for speed
         self._names: List[str] = []
@@ -660,9 +769,9 @@ class FaceDBMatcher:
 
         best_dist = 1.0 - best_sim
 
+        # Accepted if similarity >= threshold (or distance <= threshold)
         ok = (
-            best_dist
-            <= self.dist_thresh
+            best_sim >= self.sim_thresh
         )
 
         return MatchResult(
@@ -687,17 +796,27 @@ class FaceDBMatcher:
 
 
 def main():
-    db_path = Path(
-        "data/db/face_db.npz"
-    )
+    parser = argparse.ArgumentParser(description="Multi-face recognition using YuNet/Haar + ArcFace ONNX")
+    parser.add_argument("--detector", choices=["yunet", "haar"], default="yunet", help="Face detector (default: yunet)")
+    parser.add_argument("--yunet-model", default="models/face_detection_yunet_2023mar.onnx", help="YuNet ONNX model path")
+    parser.add_argument("--model", default="models/embedder_arcface.onnx", help="ArcFace ONNX model path")
+    parser.add_argument("--db", default="data/db/face_db.npz", help="Enrolled face DB path")
+    parser.add_argument("--threshold", type=float, default=0.70, help="Similarity threshold e.g. 0.70 (70%) or distance 0.30")
+    parser.add_argument("--camera", type=int, default=0, help="Camera index (default: 0)")
+    args = parser.parse_args()
 
-    det = HaarFaceMesh5pt(
-        min_size=(70, 70),
-        debug=False,
-    )
+    db_path = Path(args.db)
+
+    if args.detector == "yunet" and Path(args.yunet_model).exists():
+        print(f"[recognize] Using YuNet detector ({args.yunet_model})")
+        det = YuNetFaceDetector(model_path=args.yunet_model, debug=False)
+    else:
+        if args.detector == "yunet":
+            print(f"[recognize] Warning: YuNet model not found at {args.yunet_model}, falling back to HaarFaceMesh5pt")
+        det = HaarFaceMesh5pt(min_size=(70, 70), debug=False)
 
     embedder = ArcFaceEmbedderONNX(
-        model_path="models/embedder_arcface.onnx",
+        model_path=args.model,
         input_size=(112, 112),
         debug=False,
     )
@@ -706,19 +825,22 @@ def main():
 
     matcher = FaceDBMatcher(
         db=db,
-        dist_thresh=0.34,
-    )  # from your evaluate_new output
+        dist_thresh=args.threshold,
+    )
 
-    cap = cv2.VideoCapture(1)
-
+    # Open camera with fallback (try requested index, then try 0, 1)
+    cap = cv2.VideoCapture(args.camera)
     if not cap.isOpened():
-        raise RuntimeError(
-            "Camera not available"
-        )
+        fallback_idx = 1 if args.camera == 0 else 0
+        print(f"[recognize] Camera {args.camera} failed, trying camera {fallback_idx}...")
+        cap = cv2.VideoCapture(fallback_idx)
+    if not cap.isOpened():
+        raise RuntimeError("No working camera found. Check webcam connection.")
 
     print(
-        "Recognize (multi-face). "
-        "q=quit, r=reload DB, +/- threshold, d=debug overlay"
+        f"Recognize (multi-face). Detector={args.detector.upper()} | "
+        f"Thresh={matcher.sim_thresh*100:.0f}% (dist<={matcher.dist_thresh:.2f})\n"
+        "Keys: q=quit, r=reload DB, +/- threshold, d=debug overlay"
     )
 
     t0 = time.time()

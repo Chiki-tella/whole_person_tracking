@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import time
+import argparse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -41,6 +42,7 @@ import numpy as np
 
 from .haar_5pt import Haar5ptDetector, align_face_5pt
 from .embed import ArcFaceEmbedderONNX
+from .recognize import YuNetFaceDetector
 
 
 # -------------------------
@@ -264,24 +266,38 @@ def draw_status(
 
 
 def main():
-    cfg = EnrollConfig()
+    parser = argparse.ArgumentParser(description="Enroll identity using YuNet/Haar and ArcFace ONNX")
+    parser.add_argument("--name", default=None, help="Person name to enroll (e.g. Christella)")
+    parser.add_argument("--detector", choices=["yunet", "haar"], default="yunet", help="Face detector (default: yunet)")
+    parser.add_argument("--yunet-model", default="models/face_detection_yunet_2023mar.onnx", help="YuNet ONNX model path")
+    parser.add_argument("--camera", type=int, default=0, help="Camera index (default: 0)")
+    parser.add_argument("--samples", type=int, default=15, help="Number of samples needed (default: 15)")
+    args = parser.parse_args()
 
+    cfg = EnrollConfig()
+    cfg.samples_needed = args.samples
     ensure_dirs(cfg)
 
-    name = input(
-        "Enter person name to enroll (e.g., Alice): "
-    ).strip()
+    name = args.name
+    if not name:
+        name = input("Enter person name to enroll (e.g., Christella): ").strip()
 
     if not name:
         print("No name provided. Exiting.")
         return
 
-    # Pipeline (your working practical stack)
-    det = Haar5ptDetector(
-        min_size=(70, 70),
-        smooth_alpha=0.80,
-        debug=False,
-    )
+    # Pipeline
+    if args.detector == "yunet" and Path(args.yunet_model).exists():
+        print(f"[enroll] Using YuNet detector ({args.yunet_model})")
+        det = YuNetFaceDetector(model_path=args.yunet_model, debug=False)
+    else:
+        if args.detector == "yunet":
+            print(f"[enroll] Notice: YuNet model not found at {args.yunet_model}, falling back to Haar")
+        det = Haar5ptDetector(
+            min_size=(70, 70),
+            smooth_alpha=0.80,
+            debug=False,
+        )
 
     emb = ArcFaceEmbedderONNX(
         model_path="models/embedder_arcface.onnx",
@@ -319,10 +335,14 @@ def main():
     auto = False
     last_auto = 0.0
 
-    cap = cv2.VideoCapture(1)
+    cap = cv2.VideoCapture(args.camera)
+    if not cap.isOpened():
+        fallback_idx = 1 if args.camera == 0 else 0
+        print(f"[enroll] Camera {args.camera} failed, trying camera {fallback_idx}...")
+        cap = cv2.VideoCapture(fallback_idx)
 
     if not cap.isOpened():
-        raise RuntimeError("Failed to open camera.")
+        raise RuntimeError("Failed to open camera. Check webcam connection.")
 
     cv2.namedWindow(
         cfg.window_main,
